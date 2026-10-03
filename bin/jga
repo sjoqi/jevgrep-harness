@@ -1,0 +1,84 @@
+#!/bin/sh
+# jga — agent-facing wrapper around jg (jevgrep) for the opencode harness.
+#
+# Improvements over raw `jg`:
+#   1. Fail-fast credential check (exit 2) so the calling agent falls back to
+#      grep/lsp immediately instead of burning a 30s+ search on an auth error.
+#   2. Free `jg files` pre-flight: sizes the root, warns when it is too broad,
+#      and records the file count for measurement.
+#   3. Per-invocation usage log (TSV) under ~/.local/share/opencode/jg-usage.tsv
+#      for latency/request/cost tracking and A/B comparisons.
+#   4. Requests-used / incomplete-discovery extraction from output.
+#
+# Usage: jga "question" [root] [jg flags...]
+# Exit codes: 0 ok | 2 not authenticated (fall back to Tier 0) | other = jg's code
+
+set -u
+
+JG_LOG="$HOME/.local/share/opencode/jg-usage.tsv"
+CRED_INDICATOR="$HOME/.config/jevgrep"
+
+fail_fast() {
+  echo "jga: no jevgrep credentials found ($CRED_INDICATOR missing)." >&2
+  echo "jga: ask the user to run: jg auth   Falling back to grep/lsp for this query." >&2
+  exit 2
+}
+
+[ -x "$(command -v jg)" ] || { echo "jga: jg not installed. npm install -g @dzhng/jevgrep" >&2; exit 2; }
+[ -e "$CRED_INDICATOR" ] || fail_fast
+
+[ $# -ge 1 ] || { echo "usage: jga \"question\" [root] [flags]" >&2; exit 64; }
+
+QUERY="$1"; shift
+ROOT="."
+if [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; then ROOT="$1"; shift; fi
+
+# Refuse roots that would sweep the user's home or the filesystem: agents often
+# run from ~, and a search there is slow, expensive, and privacy-hostile.
+case "$(cd "$ROOT" 2>/dev/null && pwd)" in
+  "$HOME"|/) echo "jga: refusing root '$ROOT' — too broad. Name a project directory." >&2; exit 64 ;;
+esac
+
+# Free pre-flight: size the root, no provider calls.
+PREFLIGHT="$(jg files "$ROOT" 2>&1 | head -1)"
+NFILES="$(printf '%s' "$PREFLIGHT" | sed -n 's/.*: \([0-9,]*\) files eligible.*/\1/p' | tr -d ',')"
+[ -n "$NFILES" ] || NFILES="?"
+echo "jga: pre-flight $PREFLIGHT" >&2
+case "$NFILES" in
+  ''|'?') ;;
+  *)
+    if [ "$NFILES" -gt 8000 ]; then
+      echo "jga: WARNING root has $NFILES eligible files — discovery may exhaust its request budget in the wrong folders. Prefer a subdirectory root." >&2
+    fi
+    ;;
+esac
+
+START="$(date +%s)"
+TMP_OUT="$(mktemp "${TMPDIR:-/tmp}/jga.XXXXXX")"
+trap 'rm -f "$TMP_OUT"' EXIT
+
+jg "$QUERY" "$ROOT" "$@" >"$TMP_OUT"
+RC=$?
+END="$(date +%s)"
+SECS=$((END - START))
+
+# Extract measurements from jg output.
+REQUESTS="$(grep -o '"request-limit": [0-9]*' "$TMP_OUT" | head -1 | grep -o '[0-9]*$')"
+INCOMPLETE="no"
+grep -q "discovery incomplete" "$TMP_OUT" && INCOMPLETE="yes"
+TOP1="$(grep -o '^- "[^"]*"' "$TMP_OUT" | head -1 | sed 's/^- "//;s/"$//')"
+NRELEVANT="$(printf '%s' "$(head -1 "$TMP_OUT")" | sed -n 's/.*: \([0-9]*\) relevant files.*/\1/p')"
+
+mkdir -p "$(dirname "$JG_LOG")"
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$SECS" "${REQUESTS:-na}" "$INCOMPLETE" \
+  "${NRELEVANT:-0}" "${NFILES:?}" "$ROOT" "$QUERY" >>"$JG_LOG"
+
+# Agent-facing telemetry on stderr (stdout stays pure jg output).
+echo "jga: ${SECS}s requests=${REQUESTS:-0} incomplete=$INCOMPLETE relevant=${NRELEVANT:-0} top1=${TOP1:-none} (logged to $JG_LOG)" >&2
+if [ "$INCOMPLETE" = "yes" ]; then
+  echo "jga: discovery incomplete — narrow the root or rerun with a higher --max-requests (default 1000); do not cap below ~500 for recall-critical searches." >&2
+fi
+
+cat "$TMP_OUT"
+exit $RC
